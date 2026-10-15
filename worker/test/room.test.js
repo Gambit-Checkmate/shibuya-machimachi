@@ -12,11 +12,15 @@ import {
   isActive,
   canAttemptJudge,
   recordJudgeResult,
+  recordJudgePress,
+  bothPressedRecently,
   buildPublicState,
+  setMeetSpot,
+  isValidSpotId,
   RoomError,
   ERROR_CODES,
 } from "../src/room.js";
-import { SHIBUYA_STATION, MAX_JUDGE_CALLS, MEET_DISTANCE_M } from "../src/constants.js";
+import { SHIBUYA_STATION, MAX_JUDGE_CALLS, MEET_DISTANCE_M, BOTH_PRESSED_JUDGE_WINDOW_MS } from "../src/constants.js";
 
 const ROOM_ID = "test-room-id";
 const NOW = 1_700_000_000_000;
@@ -217,4 +221,142 @@ test("buildPublicStateのselfとotherにlat/lngのキーが存在しない", () 
 test("expiresAtはROOM_TTL_MS(3時間)後に設定される", () => {
   const room = createRoom({ hostNickname: "A", roomId: ROOM_ID, now: NOW });
   assert.equal(room.expiresAt - room.createdAt, 3 * 60 * 60 * 1000);
+});
+
+// ---- M4セキュリティ対応: 入力検証 ----
+test("ニックネームの制御文字は除去され、除去後が空なら invalid_nickname になる", () => {
+  const room = createRoom({ hostNickname: "り\u0000ょう\u0007せい", roomId: ROOM_ID, now: NOW });
+  assert.equal(room.host.nickname, "りょうせい", "制御文字だけが取り除かれる");
+
+  assert.throws(
+    () => createRoom({ hostNickname: "\u0000\u0001\u0002", roomId: ROOM_ID, now: NOW }),
+    (e) => e.code === ERROR_CODES.INVALID_NICKNAME,
+    "制御文字を除去した結果が空文字ならinvalid_nickname",
+  );
+});
+
+test("updateLocation: 範囲外(緯度91度)やInfinityの座標はinvalid_locationで拒否される", () => {
+  const { room, hostSecret } = makeActiveRoom();
+  assert.throws(
+    () => updateLocation(room, { role: "host", secret: hostSecret, lat: 91, lng: 139.7, now: NOW }),
+    (e) => e.code === ERROR_CODES.INVALID_LOCATION,
+  );
+  assert.throws(
+    () => updateLocation(room, { role: "host", secret: hostSecret, lat: Infinity, lng: 139.7, now: NOW }),
+    (e) => e.code === ERROR_CODES.INVALID_LOCATION,
+  );
+});
+
+test("updateLocation: accが負の数や有限でない場合はinvalid_locationで拒否される(未指定は許可)", () => {
+  const { room, hostSecret } = makeActiveRoom();
+  assert.throws(
+    () => updateLocation(room, { role: "host", secret: hostSecret, ...NEAR_A, acc: -1, now: NOW }),
+    (e) => e.code === ERROR_CODES.INVALID_LOCATION,
+  );
+  assert.throws(
+    () => updateLocation(room, { role: "host", secret: hostSecret, ...NEAR_A, acc: Infinity, now: NOW }),
+    (e) => e.code === ERROR_CODES.INVALID_LOCATION,
+  );
+  const ok = updateLocation(room, { role: "host", secret: hostSecret, ...NEAR_A, now: NOW }); // acc未指定
+  assert.equal(ok.accepted, true);
+});
+
+// ---- 「会えた」自己申告(押下)の記録とJevへの追加コンテキスト用フラグ ----
+test("recordJudgePress: role別に押下時刻を記録し、他のjudgeフィールドは変えない", () => {
+  const room = makeActiveRoom().room;
+  const afterHost = recordJudgePress(room, { role: "host", now: NOW });
+  assert.equal(afterHost.judge.hostPressedAt, NOW);
+  assert.equal(afterHost.judge.guestPressedAt, null);
+  assert.equal(afterHost.judge.callCount, 0);
+
+  const afterBoth = recordJudgePress(afterHost, { role: "guest", now: NOW + 1000 });
+  assert.equal(afterBoth.judge.hostPressedAt, NOW, "ホスト側の押下時刻は上書きされない");
+  assert.equal(afterBoth.judge.guestPressedAt, NOW + 1000);
+});
+
+test("bothPressedRecently: 両者の押下が60秒以内ならtrue、片方だけ/60秒超ならfalse", () => {
+  const room = makeActiveRoom().room;
+  assert.equal(bothPressedRecently(room, NOW), false, "誰も押していなければfalse");
+
+  const onlyHost = recordJudgePress(room, { role: "host", now: NOW });
+  assert.equal(bothPressedRecently(onlyHost, NOW), false, "片方だけではfalse");
+
+  const bothWithin = recordJudgePress(onlyHost, { role: "guest", now: NOW + 59_000 });
+  assert.equal(bothPressedRecently(bothWithin, NOW + 59_000), true, "59秒差ならtrue");
+
+  const bothOutside = recordJudgePress(onlyHost, { role: "guest", now: NOW + BOTH_PRESSED_JUDGE_WINDOW_MS + 1 });
+  assert.equal(
+    bothPressedRecently(bothOutside, NOW + BOTH_PRESSED_JUDGE_WINDOW_MS + 1),
+    false,
+    "60秒を超えた差はfalse",
+  );
+
+  // 押下同士が近い時刻(10秒差)でも、判定を試みた「今」から見て両方とも古ければfalse
+  // (=2人ともかなり前に押した後、しばらく経ってからゲートが通ったケースを弾く)。
+  const bothCloseButOld = recordJudgePress(onlyHost, { role: "guest", now: NOW + 10_000 });
+  assert.equal(
+    bothPressedRecently(bothCloseButOld, NOW + 5 * 60_000),
+    false,
+    "押下同士は近くても、nowから見て両方古ければfalse",
+  );
+});
+
+test("setFloor: FLOORSに無い値(B6・11F・3.5F等)はinvalid_floorで拒否される", () => {
+  const { room, hostSecret } = makeActiveRoom();
+  for (const bad of ["B6", "11F", "3.5F", "", "3f", 3]) {
+    assert.throws(
+      () => setFloor(room, { role: "host", secret: hostSecret, floor: bad, now: NOW }),
+      (e) => e.code === ERROR_CODES.INVALID_FLOOR,
+      `floor=${JSON.stringify(bad)} should be rejected`,
+    );
+  }
+});
+
+// ---- 道順案内: 待ち合わせ場所(スポットIDだけを共有する) ----
+test("setMeetSpot: 両者の承認後だけ受け付け、保存・配信するのはスポットIDだけ(座標は持たない)", () => {
+  const { room, hostSecret, guestSecret } = makeActiveRoom();
+  const next = setMeetSpot(room, { role: "guest", secret: guestSecret, spotId: "hachiko", now: NOW });
+  assert.deepEqual(next.meetSpot, { id: "hachiko", by: "guest", at: NOW });
+
+  const forHost = buildPublicState(next, "host", NOW);
+  const forGuest = buildPublicState(next, "guest", NOW);
+  assert.deepEqual(forHost.meetSpot, { id: "hachiko", byMe: false });
+  assert.deepEqual(forGuest.meetSpot, { id: "hachiko", byMe: true });
+  const text = JSON.stringify(forHost);
+  assert.ok(!/"lat"|"lng"/.test(text), "公開状態に座標が含まれない");
+
+  // 後から決めた方で上書き・nullで取り消し
+  const changed = setMeetSpot(next, { role: "host", secret: hostSecret, spotId: "moyai", now: NOW + 1 });
+  assert.equal(changed.meetSpot.id, "moyai");
+  const cleared = setMeetSpot(changed, { role: "host", secret: hostSecret, spotId: null, now: NOW + 2 });
+  assert.equal(cleared.meetSpot, null);
+  assert.equal(buildPublicState(cleared, "guest", NOW + 2).meetSpot, null);
+});
+
+test("setMeetSpot: 承認前・不正なID・認証失敗・停止後は拒否する", () => {
+  let room = createRoom({ hostNickname: "ホスト", roomId: ROOM_ID, now: NOW });
+  room = joinRoom(room, { inviteToken: room.inviteToken, nickname: "ゲスト", now: NOW });
+  assert.throws(
+    () => setMeetSpot(room, { role: "guest", secret: room.guest.secret, spotId: "hachiko", now: NOW }),
+    (err) => err instanceof RoomError && err.code === ERROR_CODES.NOT_ACTIVE,
+  );
+  const { room: active, hostSecret } = makeActiveRoom();
+  for (const bad of ["Hachiko", "hachiko/1", "", 123, { lat: 35.6, lng: 139.7 }]) {
+    assert.throws(
+      () => setMeetSpot(active, { role: "host", secret: hostSecret, spotId: bad, now: NOW }),
+      (err) => err instanceof RoomError && err.code === ERROR_CODES.INVALID_SPOT,
+      `不正なID: ${JSON.stringify(bad)}`,
+    );
+  }
+  assert.throws(
+    () => setMeetSpot(active, { role: "host", secret: "wrong", spotId: "hachiko", now: NOW }),
+    (err) => err instanceof RoomError && err.code === ERROR_CODES.UNAUTHORIZED,
+  );
+  const stopped = stopSharing(active, { role: "host", secret: hostSecret, now: NOW });
+  assert.throws(
+    () => setMeetSpot(stopped, { role: "host", secret: hostSecret, spotId: "hachiko", now: NOW }),
+    (err) => err instanceof RoomError && err.code === ERROR_CODES.STOPPED,
+  );
+  assert.equal(isValidSpotId("scramble-square"), true);
+  assert.equal(isValidSpotId("a".repeat(41)), false);
 });

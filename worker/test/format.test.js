@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { formatRelativeTime } from "../src/format.js";
+import { formatRelativeTime } from "../public/assets/js/format.js";
 
 test("formatRelativeTime: 秒・分・時間・日の相対表示", () => {
   const now = 1_000_000;
