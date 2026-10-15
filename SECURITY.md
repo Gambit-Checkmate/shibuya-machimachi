@@ -22,9 +22,14 @@
 
 ### 実装上のルール
 
-- 座標(lat/lng)そのものを**WebSocketメッセージ・APIレスポンス・ログのいずれにも含めない**。
-  相手に渡してよいのは距離(m)・方角(度)・フロアの差・更新時刻・判定結果だけです
-  (`worker/src/room.js` の `buildPublicState()` がこの境界を一元管理しています)。
+- 座標(lat/lng)そのものを**サーバーのレスポンス・ログに一切出さない**(WebSocketメッセージ・
+  APIレスポンス・ログのいずれにも含めない)。相手に渡してよいのは距離(m)・方角(度)・
+  フロアの差・更新時刻・判定結果だけです(`worker/src/room.js` の `buildPublicState()` が
+  この境界を一元管理しています)。3D渋谷の地図に出る「相手のピン」は、両者承認後
+  (`isActive()`がtrue)に限り、**相手のアプリ側だけが**自分の実座標(GPS)にサーバーから
+  届いた距離・方角を適用して画面内だけで近似計算した位置です(`worker/public/assets/js/app.js`
+  の `refreshExtras()` / AR部品の `geo.js` の `destinationPoint()`)。サーバー自身は
+  この近似位置を計算も保持もログ出力もしません。
 - 承認前(`isActive()`がfalseの間)は `updateLocation()` が位置を一切保存しません。
   「合意なく位置を溜め込まない」を優先する設計です。
 - 渋谷エリア外の座標は保存も転送もしません(`worker/src/room.js` の `updateLocation()`)。
@@ -33,6 +38,11 @@
 - `wrangler secret put JEV_API_KEY` で登録するAPIキーをリポジトリ・ログ・画面に出さない。
 - 部屋は3時間で自動終了し、位置データを含め Durable Object のストレージを丸ごと削除します
   (`worker/src/room-do.js` の `alarm()`)。
+- 道順案内(`worker/public/assets/js/route.js` / `route-panel.js`)は**端末の中だけで**経路を計算します。
+  現在地・行き先・経路をサーバーに送る処理(fetch・WebSocketメッセージ)を追加しないでください。
+  読み込むのは公開の道データ(`/route/graph.json`・`/route/places.json`)だけです。
+- 待ち合わせ場所として部屋に保存・配信するのは**スポットのID**だけです(`worker/src/room.js` の
+  `setMeetSpot()`。英小文字・数字・ハイフンのみ受け付け、座標は受け取りません)。
 
 ## English
 
@@ -57,10 +67,16 @@ sharing. The following will **not** be accepted:
 
 ### Implementation rules
 
-- Never include raw coordinates (lat/lng) in a **WebSocket message, API response, or log
-  line**. Only distance (m), bearing (degrees), floor difference, update timestamps, and
-  the judgment result may be shared with the other participant
-  (`worker/src/room.js`'s `buildPublicState()` is the single choke point for this).
+- Never put raw coordinates (lat/lng) **in a server response or a log line** (WebSocket
+  message, API response, or log — none of them). Only distance (m), bearing (degrees),
+  floor difference, update timestamps, and the judgment result may be shared with the
+  other participant (`worker/src/room.js`'s `buildPublicState()` is the single choke
+  point for this). The "partner pin" shown on the 3D Shibuya map only exists after
+  **both** sides have approved (`isActive()` is true), and is computed **client-side by
+  the other participant's own app**, by applying the server-provided distance/bearing to
+  that participant's own real GPS position (`worker/public/assets/js/app.js`'s
+  `refreshExtras()` / the AR component's `geo.js`'s `destinationPoint()`). The server
+  itself never computes, stores, or logs this approximate position.
 - Before mutual approval (`isActive()` is false), `updateLocation()` must not store any
   location at all — this project prefers storing nothing over storing something without
   consent.
@@ -71,3 +87,9 @@ sharing. The following will **not** be accepted:
 - Never commit or print the `JEV_API_KEY` secret (set via `wrangler secret put JEV_API_KEY`).
 - Rooms auto-expire after 3 hours and the entire Durable Object storage (including any
   location data) is deleted (`alarm()` in `worker/src/room-do.js`).
+- Walking directions (`worker/public/assets/js/route.js` / `route-panel.js`) are computed
+  **on-device only**. Do not add any request (fetch or WebSocket message) that sends the
+  user's position, destination, or route to the server; only the public walkway data
+  (`/route/graph.json`, `/route/places.json`) is downloaded.
+- A shared meeting spot is stored and relayed as **a spot ID only** (`setMeetSpot()` in
+  `worker/src/room.js` accepts lowercase letters/digits/hyphens and never coordinates).
